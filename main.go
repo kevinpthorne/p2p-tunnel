@@ -44,7 +44,8 @@ func main() {
 	secretKeyPath := flag.String("secret", "swarm.key", "Path to the Private Network Key (PSK)")
 	identityPath := flag.String("identity", "", "Path to Identity Key (Default: identity-<mode>.key)")
 	relayAddr := flag.String("relay", "", "Multiaddr of the Relay/Bootstrap node (Required for WAN)")
-	dataKeyHex := flag.String("datakey", "", "Hex-encoded 32-byte key for AES-GCM data encryption")
+	dataKeyPath := flag.String("datakey", "", "Hex-encoded 32-byte key for AES-GCM data encryption")
+	listenPort := flag.Int("port", 0, "Port to listen on (Default: 4001 for relay, random/0 for client/server)")
 	flag.Parse()
 
 	// Set default identity filename if not provided
@@ -52,14 +53,24 @@ func main() {
 		*identityPath = fmt.Sprintf("identity-%s.key", *mode)
 	}
 
+	// Determine final listen port
+	finalPort := *listenPort
+	if finalPort == 0 && *mode == "relay" {
+		finalPort = 4001 // Default relay port
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	// 0. Parse Data Encryption Key
 	var dataKey []byte
-	if *dataKeyHex != "" {
+	if *dataKeyPath != "" {
 		var err error
-		dataKey, err = hex.DecodeString(*dataKeyHex)
+		dataKeyHex, err := os.ReadFile(*dataKeyPath)
+		if err != nil {
+			log.Fatalf("Could not find data key file: %v", err)
+		}
+		dataKey, err = hex.DecodeString(strings.TrimSpace(string(dataKeyHex)))
 		if err != nil {
 			log.Fatalf("Invalid data key hex: %v", err)
 		}
@@ -76,7 +87,7 @@ func main() {
 	}
 
 	// 2. Setup Libp2p Host
-	h, dhtObj, err := makeHost(ctx, *secretKeyPath, *mode, privKey, *relayAddr)
+	h, dhtObj, err := makeHost(ctx, *secretKeyPath, *mode, privKey, *relayAddr, finalPort)
 	if err != nil {
 		log.Fatalf("Failed to create host: %v", err)
 	}
@@ -86,6 +97,7 @@ func main() {
 	log.Printf("Node Started. Mode: %s", strings.ToUpper(*mode))
 	log.Printf("Peer ID: %s", h.ID())
 	log.Printf("Identity File: %s", *identityPath)
+	log.Printf("Listening Port: %d", finalPort)
 	log.Printf("-------------------------------------------------")
 
 	// 3. Connect to Relay
@@ -93,7 +105,7 @@ func main() {
 		if *relayAddr == "" {
 			log.Fatal("❌ Error: Client/Server mode requires a -relay address.")
 		}
-		
+
 		log.Printf("🔌 Dialing Relay: %s", *relayAddr)
 		connectToPeer(ctx, h, *relayAddr)
 
@@ -135,22 +147,26 @@ func main() {
 
 // --- Host Factory & Identity ---
 
-func makeHost(ctx context.Context, pskPath, mode string, privKey crypto.PrivKey, relayAddrStr string) (host.Host, *dht.IpfsDHT, error) {
+func makeHost(ctx context.Context, pskPath, mode string, privKey crypto.PrivKey, relayAddrStr string, port int) (host.Host, *dht.IpfsDHT, error) {
+	// Construct Listen Addresses
+	quicListen := fmt.Sprintf("/ip4/0.0.0.0/udp/%d/quic-v1", port)
+	tcpListen := fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", port)
+
 	opts := []libp2p.Option{
 		libp2p.Identity(privKey),
-		libp2p.ListenAddrStrings("/ip4/0.0.0.0/udp/0/quic-v1", "/ip4/0.0.0.0/tcp/0"),
-		libp2p.EnableHolePunching(),
+		libp2p.ListenAddrStrings(quicListen, tcpListen),
 	}
 
 	if mode == "relay" {
-		opts = []libp2p.Option{
-			libp2p.Identity(privKey),
-			libp2p.ListenAddrStrings("/ip4/0.0.0.0/udp/4001/quic-v1", "/ip4/0.0.0.0/tcp/4001"),
+		opts = append(opts,
 			libp2p.EnableRelayService(),
 			libp2p.ForceReachabilityPublic(),
-		}
+		)
 	} else {
-		opts = append(opts, libp2p.ForceReachabilityPrivate())
+		opts = append(opts,
+			libp2p.EnableHolePunching(),
+			libp2p.ForceReachabilityPrivate(),
+		)
 	}
 
 	// STRICT KEY CHECK
@@ -158,7 +174,7 @@ func makeHost(ctx context.Context, pskPath, mode string, privKey crypto.PrivKey,
 	if err != nil {
 		return nil, nil, fmt.Errorf("❌ FATAL: Could not open swarm.key at '%s'. \n   You are running in Private Mode: this file is REQUIRED.\n   Please copy swarm.key to this directory.", pskPath)
 	}
-	
+
 	// Calculate fingerprint to help debugging
 	pskBytes, _ := io.ReadAll(pskFile)
 	pskFile.Seek(0, 0) // Reset read pointer
@@ -258,7 +274,7 @@ func runServer(h host.Host, targetPort string, dataKey []byte) {
 
 func runClient(ctx context.Context, h host.Host, discovery *routing.RoutingDiscovery, localPort string, dataKey []byte) {
 	var serverPeer peer.AddrInfo
-	
+
 	log.Println("🔍 Starting discovery loop...")
 
 	for {
@@ -277,12 +293,12 @@ func runClient(ctx context.Context, h host.Host, discovery *routing.RoutingDisco
 			}
 			// We found someone!
 			log.Printf("✨ Discovered Peer: %s. Connecting...", p.ID)
-			
+
 			if err := h.Connect(ctx, p); err != nil {
 				log.Printf("⚠️ Connection failed to %s: %v", p.ID, err)
 				continue
 			}
-			
+
 			serverPeer = p
 			found = true
 			log.Printf("✅ Connection Established to Server: %s", p.ID)
@@ -390,12 +406,20 @@ func gcmEncryptLoop(src io.Reader, dst io.Writer, key []byte) error {
 			totalLen := uint32(len(nonce) + len(ciphertext))
 			binary.BigEndian.PutUint32(header[:4], totalLen)
 
-			if _, err := dst.Write(header[:4]); err != nil { return err }
-			if _, err := dst.Write(nonce); err != nil { return err }
-			if _, err := dst.Write(ciphertext); err != nil { return err }
+			if _, err := dst.Write(header[:4]); err != nil {
+				return err
+			}
+			if _, err := dst.Write(nonce); err != nil {
+				return err
+			}
+			if _, err := dst.Write(ciphertext); err != nil {
+				return err
+			}
 		}
 		if err != nil {
-			if err == io.EOF { return nil }
+			if err == io.EOF {
+				return nil
+			}
 			return err
 		}
 	}
@@ -417,7 +441,9 @@ func gcmDecryptLoop(src io.Reader, dst io.Writer, key []byte) error {
 
 	for {
 		if _, err := io.ReadFull(src, lenBuf); err != nil {
-			if err == io.EOF { return nil }
+			if err == io.EOF {
+				return nil
+			}
 			return err
 		}
 		totalLen := binary.BigEndian.Uint32(lenBuf)
@@ -426,15 +452,23 @@ func gcmDecryptLoop(src io.Reader, dst io.Writer, key []byte) error {
 			return fmt.Errorf("oversized chunk")
 		}
 
-		if _, err := io.ReadFull(src, nonce); err != nil { return err }
+		if _, err := io.ReadFull(src, nonce); err != nil {
+			return err
+		}
 
 		cipherLen := totalLen - uint32(len(nonce))
 		cipherBuf := make([]byte, cipherLen)
-		if _, err := io.ReadFull(src, cipherBuf); err != nil { return err }
+		if _, err := io.ReadFull(src, cipherBuf); err != nil {
+			return err
+		}
 
 		plaintext, err := gcm.Open(nil, nonce, cipherBuf, nil)
-		if err != nil { return err }
+		if err != nil {
+			return err
+		}
 
-		if _, err := dst.Write(plaintext); err != nil { return err }
+		if _, err := dst.Write(plaintext); err != nil {
+			return err
+		}
 	}
 }
