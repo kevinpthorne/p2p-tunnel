@@ -26,7 +26,6 @@ import (
 	"github.com/libp2p/go-libp2p/core/pnet"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	dutil "github.com/libp2p/go-libp2p/p2p/discovery/util"
-	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	"github.com/multiformats/go-multiaddr"
 )
 
@@ -115,12 +114,14 @@ func main() {
 	}
 }
 
-// --- Host Factory & Identity (Same as before) ---
+// --- Host Factory & Identity ---
+
 func makeHost(ctx context.Context, pskPath, mode string, privKey crypto.PrivKey, relayAddrStr string) (host.Host, *dht.IpfsDHT, error) {
-	rm := rcmgr.NewFixedLimiter(rcmgr.InfiniteLimits)
+	// Note: We are using default resource limits to avoid version compatibility issues.
+	// For production high-throughput, consider configuring libp2p.ResourceManager with higher limits.
+
 	opts := []libp2p.Option{
 		libp2p.Identity(privKey),
-		libp2p.ResourceManager(rm),
 		libp2p.ListenAddrStrings("/ip4/0.0.0.0/udp/0/quic-v1", "/ip4/0.0.0.0/tcp/0"),
 		libp2p.EnableHolePunching(),
 	}
@@ -128,7 +129,6 @@ func makeHost(ctx context.Context, pskPath, mode string, privKey crypto.PrivKey,
 	if mode == "relay" {
 		opts = []libp2p.Option{
 			libp2p.Identity(privKey),
-			libp2p.ResourceManager(rm),
 			libp2p.ListenAddrStrings("/ip4/0.0.0.0/udp/4001/quic-v1", "/ip4/0.0.0.0/tcp/4001"),
 			libp2p.EnableRelayService(),
 			libp2p.ForceReachabilityPublic(),
@@ -150,7 +150,7 @@ func makeHost(ctx context.Context, pskPath, mode string, privKey crypto.PrivKey,
 		return nil, nil, err
 	}
 
-	// --- DHT Configuration (The Fix) ---
+	// --- DHT Configuration ---
 
 	// 1. Define DHT Mode
 	dhtMode := dht.Mode(dht.ModeClient)
@@ -159,8 +159,6 @@ func makeHost(ctx context.Context, pskPath, mode string, privKey crypto.PrivKey,
 	}
 
 	// 2. Define Bootstrap Peers
-	// If we are a Client/Server, we MUST bootstrap from the Relay.
-	// If we don't specify this, Libp2p uses public defaults (IPFS nodes), which hang.
 	var bootstrapPeers []peer.AddrInfo
 	if relayAddrStr != "" {
 		ma, err := multiaddr.NewMultiaddr(relayAddrStr)
@@ -175,10 +173,7 @@ func makeHost(ctx context.Context, pskPath, mode string, privKey crypto.PrivKey,
 	// 3. Create DHT with Explicit Options
 	kademliaDHT, err := dht.New(ctx, h,
 		dhtMode,
-		// CRITICAL: Force the DHT to use our private protocol name.
-		// This stops it from merging with the public IPFS DHT.
 		dht.ProtocolPrefix("/my-private-cluster/kad/1.0.0"),
-		// CRITICAL: Only use our relay as a bootstrap peer.
 		dht.BootstrapPeers(bootstrapPeers...),
 	)
 
