@@ -122,15 +122,6 @@ func main() {
 	switch *mode {
 	case "relay":
 		log.Println("🟢 Relay Active. Waiting for peers...")
-		go func() {
-			for {
-				log.Println("--- Relay Addresses (Copy one of these to clients) ---")
-				for _, a := range h.Addrs() {
-					log.Printf("%s/p2p/%s", a, h.ID())
-				}
-				time.Sleep(30 * time.Second)
-			}
-		}()
 		select {}
 	case "server":
 		runServer(ctx, h, routingDiscovery, *target, dataKey)
@@ -145,6 +136,17 @@ func makeHost(ctx context.Context, pskPath, mode string, privKey crypto.PrivKey,
 	// Construct Listen Addresses
 	quicListen := fmt.Sprintf("/ip4/0.0.0.0/udp/%d/quic-v1", port)
 	tcpListen := fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", port)
+
+	var bootstrapPeers []peer.AddrInfo
+	if relayAddrStr != "" {
+		ma, err := multiaddr.NewMultiaddr(relayAddrStr)
+		if err == nil {
+			pi, err := peer.AddrInfoFromP2pAddr(ma)
+			if err == nil {
+				bootstrapPeers = append(bootstrapPeers, *pi)
+			}
+		}
+	}
 
 	opts := []libp2p.Option{
 		libp2p.Identity(privKey),
@@ -162,6 +164,7 @@ func makeHost(ctx context.Context, pskPath, mode string, privKey crypto.PrivKey,
 		)
 	} else {
 		opts = append(opts,
+			libp2p.EnableAutoRelayWithStaticRelays(bootstrapPeers),
 			libp2p.EnableHolePunching(),
 			libp2p.ForceReachabilityPrivate(),
 		)
@@ -196,17 +199,6 @@ func makeHost(ctx context.Context, pskPath, mode string, privKey crypto.PrivKey,
 	dhtMode := dht.Mode(dht.ModeClient)
 	if mode == "relay" {
 		dhtMode = dht.Mode(dht.ModeServer)
-	}
-
-	var bootstrapPeers []peer.AddrInfo
-	if relayAddrStr != "" {
-		ma, err := multiaddr.NewMultiaddr(relayAddrStr)
-		if err == nil {
-			pi, err := peer.AddrInfoFromP2pAddr(ma)
-			if err == nil {
-				bootstrapPeers = append(bootstrapPeers, *pi)
-			}
-		}
 	}
 
 	kademliaDHT, err := dht.New(ctx, h,
