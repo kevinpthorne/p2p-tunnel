@@ -29,9 +29,6 @@ import (
 	dutil "github.com/libp2p/go-libp2p/p2p/discovery/util"
 	"github.com/multiformats/go-multiaddr"
 	manet "github.com/multiformats/go-multiaddr/net"
-
-	"github.com/libp2p/go-libp2p/p2p/host/autorelay"
-	basichost "github.com/libp2p/go-libp2p/p2p/host/basic"
 )
 
 // Configuration Constants
@@ -127,7 +124,7 @@ func main() {
 		log.Println("🟢 Relay Active. Waiting for peers...")
 		select {}
 	case "server":
-		runServer(ctx, h, routingDiscovery, *target, dataKey)
+		runServer(h, routingDiscovery, *target, dataKey)
 	case "client":
 		runClient(ctx, h, routingDiscovery, *target, dataKey)
 	}
@@ -154,8 +151,28 @@ func makeHost(ctx context.Context, pskPath, mode string, privKey crypto.PrivKey,
 	opts := []libp2p.Option{
 		libp2p.Identity(privKey),
 		libp2p.ListenAddrStrings(quicListen, tcpListen),
-		libp2p.AddrsFactory(func(m []multiaddr.Multiaddr) []multiaddr.Multiaddr {
-			return multiaddr.FilterAddrs(m, manet.IsPublicAddr)
+		// 1. IMPROVED ADDRS FACTORY:
+		// Instead of blindly filtering everything, we explicitly Allow:
+		// - Public Addresses (as detected by AutoNAT)
+		// - Relay Addresses (p2p-circuit)
+		// We Filter:
+		// - Private LAN IPs (so we don't advertise 192.168.x.x to WAN)
+		libp2p.AddrsFactory(func(addrs []multiaddr.Multiaddr) []multiaddr.Multiaddr {
+			var valid []multiaddr.Multiaddr
+			for _, addr := range addrs {
+				// Always allow Relay Addresses
+				if strings.Contains(addr.String(), "p2p-circuit") {
+					valid = append(valid, addr)
+					continue
+				}
+				// Allow Public IPs (IPv4/IPv6)
+				if manet.IsPublicAddr(addr) {
+					valid = append(valid, addr)
+					continue
+				}
+				// Filter out Private IPs (192.168.x.x, etc)
+			}
+			return valid
 		}),
 	}
 
@@ -163,13 +180,18 @@ func makeHost(ctx context.Context, pskPath, mode string, privKey crypto.PrivKey,
 		opts = append(opts,
 			libp2p.EnableRelayService(),
 			libp2p.ForceReachabilityPublic(),
-			libp2p.EnableNATService(),
+			libp2p.EnableNATService(), // IMPORTANT: Helps clients find their public IP
 		)
 	} else {
 		opts = append(opts,
+			// 2. ENABLE AUTO RELAY & HOLE PUNCHING
+			// We use the relay for connectivity if NAT fails.
 			libp2p.EnableAutoRelayWithStaticRelays(bootstrapPeers),
 			libp2p.EnableHolePunching(),
-			libp2p.ForceReachabilityPrivate(),
+			// 3. REMOVED ForceReachabilityPrivate
+			// We want AutoNAT to run naturally. If it detects we are behind NAT,
+			// it will trigger AutoRelay. If it detects a Public IP (e.g. static mapped),
+			// it will use it.
 		)
 	}
 
@@ -245,28 +267,44 @@ func connectToPeer(ctx context.Context, h host.Host, target string) {
 		log.Fatal("   Check: 1. Swarm Key matches?\n2. Is Relay running?\n3. Is IP reachable?")
 	}
 	log.Println("✅ Connected to Relay successfully.")
-
-	idService := h.(*autorelay.AutoRelayHost).Host.(*basichost.BasicHost).IDService()
-	for {
-		hasPublicAddr := false
-		for _, addr := range idService.OwnObservedAddrs() {
-			if manet.IsPublicAddr(addr) {
-				hasPublicAddr = true
-				break
-			}
-		}
-		if hasPublicAddr {
-			log.Printf("Observed self Addrs: %v\n", idService.OwnObservedAddrs())
-			break
-		}
-		time.Sleep(1 * time.Second)
-	}
 }
 
 // --- App Logic ---
 
-func runServer(ctx context.Context, h host.Host, discovery *routing.RoutingDiscovery, targetPort string, dataKey []byte) {
-	log.Println("📢 Advertising service availability...")
+func runServer(h host.Host, discovery *routing.RoutingDiscovery, targetPort string, dataKey []byte) {
+	// 4. WAIT LOGIC
+	// We must NOT advertise to the DHT until we have a usable Public or Relay address.
+	// Advertising local IPs (192.168...) causes the client to fail with i/o timeout.
+	log.Println("⏳ Analyzing Reachability (AutoNAT/AutoRelay)...")
+
+	for {
+		hasUsableAddr := false
+		addrs := h.Addrs()
+
+		for _, addr := range addrs {
+			// Check for Relay Address (p2p-circuit)
+			if strings.Contains(addr.String(), "p2p-circuit") {
+				hasUsableAddr = true
+			}
+			// Check for Public IP (Verified by AutoNAT)
+			if manet.IsPublicAddr(addr) {
+				hasUsableAddr = true
+			}
+		}
+
+		if hasUsableAddr {
+			log.Println("✅ Valid WAN Address confirmed. Advertising service to cluster...")
+			// Log what we are actually advertising
+			for _, a := range addrs {
+				log.Printf("   - %s", a)
+			}
+			break
+		}
+
+		log.Println("... Waiting for Public/Relay address resolution ...")
+		time.Sleep(2 * time.Second)
+	}
+
 	dutil.Advertise(context.Background(), discovery, RendezvousStr)
 
 	h.SetStreamHandler(TunnelProtocol, func(s network.Stream) {
