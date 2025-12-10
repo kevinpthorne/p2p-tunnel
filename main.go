@@ -29,6 +29,9 @@ import (
 	dutil "github.com/libp2p/go-libp2p/p2p/discovery/util"
 	"github.com/multiformats/go-multiaddr"
 	manet "github.com/multiformats/go-multiaddr/net"
+
+	"github.com/libp2p/go-libp2p/p2p/host/autorelay"
+	basichost "github.com/libp2p/go-libp2p/p2p/host/basic"
 )
 
 // Configuration Constants
@@ -239,9 +242,25 @@ func connectToPeer(ctx context.Context, h host.Host, target string) {
 	if err := h.Connect(ctx, *info); err != nil {
 		log.Printf("❌ Failed to dial Relay %s", info.ID)
 		log.Printf("   Error Details: %v", err)
-		log.Fatal("   Check: 1. Swarm Key matches? 2. Is Relay running? 3. Is IP reachable?")
+		log.Fatal("   Check: 1. Swarm Key matches?\n2. Is Relay running?\n3. Is IP reachable?")
 	}
 	log.Println("✅ Connected to Relay successfully.")
+
+	idService := h.(*autorelay.AutoRelayHost).Host.(*basichost.BasicHost).IDService()
+	for {
+		hasPublicAddr := false
+		for _, addr := range idService.OwnObservedAddrs() {
+			if manet.IsPublicAddr(addr) {
+				hasPublicAddr = true
+				break
+			}
+		}
+		if hasPublicAddr {
+			log.Printf("Observed self Addrs: %v\n", idService.OwnObservedAddrs())
+			break
+		}
+		time.Sleep(1 * time.Second)
+	}
 }
 
 // --- App Logic ---
