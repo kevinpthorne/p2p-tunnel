@@ -44,7 +44,7 @@ func main() {
 	secretKeyPath := flag.String("secret", "swarm.key", "Path to the Private Network Key (PSK)")
 	identityPath := flag.String("identity", "", "Path to Identity Key (Default: identity-<mode>.key)")
 	relayAddr := flag.String("relay", "", "Multiaddr of the Relay/Bootstrap node (Required for WAN)")
-	dataKeyPath := flag.String("datakey", "", "Hex-encoded 32-byte key for AES-GCM data encryption")
+	dataKeyHex := flag.String("datakey", "", "Hex-encoded 32-byte key for AES-GCM data encryption")
 	listenPort := flag.Int("port", 0, "Port to listen on (Default: 4001 for relay, random/0 for client/server)")
 	flag.Parse()
 
@@ -64,13 +64,9 @@ func main() {
 
 	// 0. Parse Data Encryption Key
 	var dataKey []byte
-	if *dataKeyPath != "" {
+	if *dataKeyHex != "" {
 		var err error
-		dataKeyHex, err := os.ReadFile(*dataKeyPath)
-		if err != nil {
-			log.Fatalf("Could not find data key file: %v", err)
-		}
-		dataKey, err = hex.DecodeString(strings.TrimSpace(string(dataKeyHex)))
+		dataKey, err = hex.DecodeString(*dataKeyHex)
 		if err != nil {
 			log.Fatalf("Invalid data key hex: %v", err)
 		}
@@ -125,7 +121,6 @@ func main() {
 	switch *mode {
 	case "relay":
 		log.Println("🟢 Relay Active. Waiting for peers...")
-		// Print addresses periodically to help user
 		go func() {
 			for {
 				log.Println("--- Relay Addresses (Copy one of these to clients) ---")
@@ -137,9 +132,7 @@ func main() {
 		}()
 		select {}
 	case "server":
-		log.Println("📢 Advertising service availability...")
-		dutil.Advertise(ctx, routingDiscovery, RendezvousStr)
-		runServer(h, *target, dataKey)
+		runServer(ctx, h, routingDiscovery, *target, dataKey)
 	case "client":
 		runClient(ctx, h, routingDiscovery, *target, dataKey)
 	}
@@ -161,6 +154,7 @@ func makeHost(ctx context.Context, pskPath, mode string, privKey crypto.PrivKey,
 		opts = append(opts,
 			libp2p.EnableRelayService(),
 			libp2p.ForceReachabilityPublic(),
+			libp2p.EnableNATService(),
 		)
 	} else {
 		opts = append(opts,
@@ -246,7 +240,6 @@ func connectToPeer(ctx context.Context, h host.Host, target string) {
 		log.Fatalf("❌ Invalid peer info: %v", err)
 	}
 
-	// STRICT ERROR HANDLING
 	if err := h.Connect(ctx, *info); err != nil {
 		log.Printf("❌ Failed to dial Relay %s", info.ID)
 		log.Printf("   Error Details: %v", err)
@@ -257,7 +250,7 @@ func connectToPeer(ctx context.Context, h host.Host, target string) {
 
 // --- App Logic ---
 
-func runServer(h host.Host, targetPort string, dataKey []byte) {
+func runServer(ctx context.Context, h host.Host, discovery *routing.RoutingDiscovery, targetPort string, dataKey []byte) {
 	h.SetStreamHandler(TunnelProtocol, func(s network.Stream) {
 		log.Printf("New Connection from %s", s.Conn().RemotePeer())
 		local, err := net.Dial("tcp", targetPort)
