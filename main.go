@@ -13,6 +13,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -38,6 +39,9 @@ const (
 	ReadBufferSize = 32 * 1024                      // 32KB chunks for GCM
 )
 
+// Global variable to hold the detected WAN IP (if any)
+var globalWanIP string
+
 func main() {
 	// --- CLI Flags ---
 	mode := flag.String("mode", "client", "Mode: 'relay', 'server', or 'client'")
@@ -49,15 +53,13 @@ func main() {
 	listenPort := flag.Int("port", 0, "Port to listen on (Default: 4001 for relay, random/0 for client/server)")
 	flag.Parse()
 
-	// Set default identity filename if not provided
 	if *identityPath == "" {
 		*identityPath = fmt.Sprintf("identity-%s.key", *mode)
 	}
 
-	// Determine final listen port
 	finalPort := *listenPort
 	if finalPort == 0 && *mode == "relay" {
-		finalPort = 4001 // Default relay port
+		finalPort = 4001
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -77,13 +79,27 @@ func main() {
 		log.Println("🔒 AES-GCM Authenticated Encryption ENABLED")
 	}
 
-	// 1. Load or Generate Identity
+	// 1. IP Detection (Fallback Strategy)
+	// If we are a Server on WAN, we try to fetch our Public IP to ensure we advertise it
+	// even if AutoNAT fails due to firewall issues.
+	if *mode != "relay" {
+		go func() {
+			log.Println("🌍 Attempting to detect WAN IP via Web (Fallback)...")
+			ip := getWANIP()
+			if ip != "" {
+				log.Printf("✅ Detected WAN IP: %s", ip)
+				globalWanIP = ip
+			}
+		}()
+	}
+
+	// 2. Load Identity
 	privKey, err := getIdentity(*identityPath)
 	if err != nil {
 		log.Fatalf("Failed to manage identity: %v", err)
 	}
 
-	// 2. Setup Libp2p Host
+	// 3. Setup Libp2p Host
 	h, dhtObj, err := makeHost(ctx, *secretKeyPath, *mode, privKey, *relayAddr, finalPort)
 	if err != nil {
 		log.Fatalf("Failed to create host: %v", err)
@@ -93,30 +109,28 @@ func main() {
 	log.Printf("-------------------------------------------------")
 	log.Printf("Node Started. Mode: %s", strings.ToUpper(*mode))
 	log.Printf("Peer ID: %s", h.ID())
-	log.Printf("Identity File: %s", *identityPath)
 	log.Printf("Listening Port: %d", finalPort)
 	log.Printf("-------------------------------------------------")
 
-	// 3. Connect to Relay
+	// 4. Connect to Relay
 	if *mode != "relay" {
 		if *relayAddr == "" {
 			log.Fatal("❌ Error: Client/Server mode requires a -relay address.")
 		}
-
 		log.Printf("🔌 Dialing Relay: %s", *relayAddr)
 		connectToPeer(ctx, h, *relayAddr)
 
-		log.Println("⏳ Waiting for DHT routing table update...")
+		// Give AutoRelay a moment to reserve a slot, but don't block forever
 		time.Sleep(2 * time.Second)
 	}
 
-	// 4. Start DHT
+	// 5. Start DHT
 	log.Println("🔄 Bootstrapping DHT...")
 	if err := dhtObj.Bootstrap(ctx); err != nil {
 		log.Fatal(err)
 	}
 
-	// 5. Execution Logic
+	// 6. Execution Logic
 	routingDiscovery := routing.NewRoutingDiscovery(dhtObj)
 
 	switch *mode {
@@ -124,7 +138,7 @@ func main() {
 		log.Println("🟢 Relay Active. Waiting for peers...")
 		select {}
 	case "server":
-		runServer(h, routingDiscovery, *target, dataKey)
+		runServer(h, routingDiscovery, *target, dataKey, finalPort)
 	case "client":
 		runClient(ctx, h, routingDiscovery, *target, dataKey)
 	}
@@ -133,7 +147,6 @@ func main() {
 // --- Host Factory & Identity ---
 
 func makeHost(ctx context.Context, pskPath, mode string, privKey crypto.PrivKey, relayAddrStr string, port int) (host.Host, *dht.IpfsDHT, error) {
-	// Construct Listen Addresses
 	quicListen := fmt.Sprintf("/ip4/0.0.0.0/udp/%d/quic-v1", port)
 	tcpListen := fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", port)
 
@@ -151,25 +164,36 @@ func makeHost(ctx context.Context, pskPath, mode string, privKey crypto.PrivKey,
 	opts := []libp2p.Option{
 		libp2p.Identity(privKey),
 		libp2p.ListenAddrStrings(quicListen, tcpListen),
-		// 1. IMPROVED ADDRS FACTORY:
+
+		// ADDRS FACTORY (The Logic Core)
 		libp2p.AddrsFactory(func(addrs []multiaddr.Multiaddr) []multiaddr.Multiaddr {
 			var valid []multiaddr.Multiaddr
+
+			// 1. If we detected a WAN IP via Web, force inject it
+			if globalWanIP != "" {
+				// Try to construct a multiaddr for the detected IP using the bound port
+				extAddrStr := fmt.Sprintf("/ip4/%s/udp/%d/quic-v1", globalWanIP, port)
+				if ma, err := multiaddr.NewMultiaddr(extAddrStr); err == nil {
+					valid = append(valid, ma)
+				}
+			}
+
+			// 2. Process existing addresses
 			for _, addr := range addrs {
 				// Always allow Relay Addresses
 				if strings.Contains(addr.String(), "p2p-circuit") {
 					valid = append(valid, addr)
 					continue
 				}
-				// Allow Public IPs (IPv4/IPv6)
+				// Allow Public IPs (IPv4/IPv6) from AutoNAT
 				if manet.IsPublicAddr(addr) {
 					valid = append(valid, addr)
 					continue
 				}
 			}
 
-			// FALLBACK: If we have NO valid WAN addresses (Relay or Public),
-			// return the original list (Private IPs).
-			// This prevents the node from advertising NOTHING and getting stuck.
+			// 3. Fallback: If we have NO Public/Relay addresses, return Private IPs
+			// This ensures we advertise *something* instead of nothing.
 			if len(valid) == 0 {
 				return addrs
 			}
@@ -182,27 +206,21 @@ func makeHost(ctx context.Context, pskPath, mode string, privKey crypto.PrivKey,
 		opts = append(opts,
 			libp2p.EnableRelayService(),
 			libp2p.ForceReachabilityPublic(),
-			libp2p.EnableNATService(), // IMPORTANT: Helps clients find their public IP
+			libp2p.EnableNATService(),
 		)
 	} else {
 		opts = append(opts,
-			// 2. ENABLE AUTO RELAY & HOLE PUNCHING
-			// We use the relay for connectivity if NAT fails.
 			libp2p.EnableAutoRelayWithStaticRelays(bootstrapPeers),
 			libp2p.EnableHolePunching(),
-			// 3. REMOVED ForceReachabilityPrivate to allow AutoNAT checks
 		)
 	}
 
-	// STRICT KEY CHECK
 	pskFile, err := os.Open(pskPath)
 	if err != nil {
-		return nil, nil, fmt.Errorf("❌ FATAL: Could not open swarm.key at '%s'. \n   You are running in Private Mode: this file is REQUIRED.\n   Please copy swarm.key to this directory.", pskPath)
+		return nil, nil, fmt.Errorf("❌ FATAL: Could not open swarm.key at '%s'. \n   You are running in Private Mode: this file is REQUIRED.", pskPath)
 	}
-
-	// Calculate fingerprint to help debugging
 	pskBytes, _ := io.ReadAll(pskFile)
-	pskFile.Seek(0, 0) // Reset read pointer
+	pskFile.Seek(0, 0)
 	hash := sha256.Sum256(pskBytes)
 	log.Printf("🔑 Swarm Key Fingerprint: %x (First 6 bytes: %x)", hash, hash[:6])
 
@@ -211,14 +229,11 @@ func makeHost(ctx context.Context, pskPath, mode string, privKey crypto.PrivKey,
 		return nil, nil, fmt.Errorf("❌ FATAL: Invalid swarm.key format: %v", err)
 	}
 	opts = append(opts, libp2p.PrivateNetwork(psk))
-	log.Println("🔒 Private Network Mode: ENABLED")
 
 	h, err := libp2p.New(opts...)
 	if err != nil {
 		return nil, nil, err
 	}
-
-	// --- DHT Configuration ---
 
 	dhtMode := dht.Mode(dht.ModeClient)
 	if mode == "relay" {
@@ -250,70 +265,66 @@ func getIdentity(path string) (crypto.PrivKey, error) {
 	return priv, nil
 }
 
+// Helper to get WAN IP from external services
+func getWANIP() string {
+	services := []string{
+		"https://api.ipify.org?format=text",
+		"https://ifconfig.me/ip",
+		"https://icanhazip.com",
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	for _, service := range services {
+		resp, err := client.Get(service)
+		if err != nil {
+			continue
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			continue
+		}
+		ipStr := strings.TrimSpace(string(body))
+		if net.ParseIP(ipStr) != nil {
+			return ipStr
+		}
+	}
+	return ""
+}
+
 func connectToPeer(ctx context.Context, h host.Host, target string) {
 	ma, err := multiaddr.NewMultiaddr(target)
 	if err != nil {
-		log.Fatalf("❌ Invalid relay address format: %v", err)
+		log.Fatalf("❌ Invalid relay address: %v", err)
 	}
 	info, err := peer.AddrInfoFromP2pAddr(ma)
 	if err != nil {
 		log.Fatalf("❌ Invalid peer info: %v", err)
 	}
-
 	if err := h.Connect(ctx, *info); err != nil {
-		log.Printf("❌ Failed to dial Relay %s", info.ID)
-		log.Printf("   Error Details: %v", err)
-		log.Fatal("   Check: 1. Swarm Key matches?\n2. Is Relay running?\n3. Is IP reachable?")
+		log.Printf("❌ Failed to dial Relay %s: %v", info.ID, err)
+		log.Fatal("   Check: 1. Swarm Key matches? 2. Is Relay running? 3. Is IP reachable?")
 	}
 	log.Println("✅ Connected to Relay successfully.")
 }
 
 // --- App Logic ---
 
-func runServer(h host.Host, discovery *routing.RoutingDiscovery, targetPort string, dataKey []byte) {
-	// 4. WAIT LOGIC
-	// We must NOT advertise to the DHT until we have a usable Public or Relay address.
-	// Advertising local IPs (192.168...) causes the client to fail with i/o timeout.
-	log.Println("⏳ Analyzing Reachability (AutoNAT/AutoRelay)...")
+func runServer(h host.Host, discovery *routing.RoutingDiscovery, targetPort string, dataKey []byte, listenPort int) {
+	// Log the final status before starting
+	log.Println("📢 Advertising service availability...")
 
-	timeout := time.After(15 * time.Second)
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-timeout:
-			log.Println("⚠️  Reachability checks timed out. Proceeding with available addresses (Fallback mode).")
-			log.Println("    If you are on WAN, this might fail unless you have a public IP.")
-			goto ADVERTISE
-		case <-ticker.C:
-			hasUsableAddr := false
+	// Periodically print what we are advertising so user can debug
+	go func() {
+		for {
 			addrs := h.Addrs()
-
-			for _, addr := range addrs {
-				// Check for Relay Address (p2p-circuit)
-				if strings.Contains(addr.String(), "p2p-circuit") {
-					hasUsableAddr = true
-				}
-				// Check for Public IP (Verified by AutoNAT)
-				if manet.IsPublicAddr(addr) {
-					hasUsableAddr = true
-				}
+			log.Println("--- Current Advertised Addresses ---")
+			for _, a := range addrs {
+				log.Printf("   %s/p2p/%s", a, h.ID())
 			}
-
-			if hasUsableAddr {
-				log.Println("✅ Valid WAN Address confirmed. Advertising service to cluster...")
-				// Log what we are actually advertising
-				for _, a := range addrs {
-					log.Printf("   - %s", a)
-				}
-				goto ADVERTISE
-			}
-			log.Println("... Waiting for Public/Relay address resolution ...")
+			time.Sleep(30 * time.Second)
 		}
-	}
+	}()
 
-ADVERTISE:
 	dutil.Advertise(context.Background(), discovery, RendezvousStr)
 
 	h.SetStreamHandler(TunnelProtocol, func(s network.Stream) {
@@ -332,7 +343,6 @@ ADVERTISE:
 
 func runClient(ctx context.Context, h host.Host, discovery *routing.RoutingDiscovery, localPort string, dataKey []byte) {
 	var serverPeer peer.AddrInfo
-
 	log.Println("🔍 Starting discovery loop...")
 
 	for {
@@ -349,9 +359,10 @@ func runClient(ctx context.Context, h host.Host, discovery *routing.RoutingDisco
 			if p.ID == h.ID() {
 				continue
 			}
-			// We found someone!
+
 			log.Printf("✨ Discovered Peer: %s. Connecting...", p.ID)
 
+			// Try to connect to all addresses, including the ones we injected
 			if err := h.Connect(ctx, p); err != nil {
 				log.Printf("⚠️ Connection failed to %s: %v", p.ID, err)
 				continue
@@ -366,12 +377,10 @@ func runClient(ctx context.Context, h host.Host, discovery *routing.RoutingDisco
 		if found {
 			break
 		}
-
 		log.Println("... No peers found yet. Retrying in 3s...")
 		time.Sleep(3 * time.Second)
 	}
 
-	// Start Local Listener
 	listener, err := net.Listen("tcp", localPort)
 	if err != nil {
 		log.Fatal(err)
@@ -382,13 +391,11 @@ func runClient(ctx context.Context, h host.Host, discovery *routing.RoutingDisco
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			log.Println("Listener error:", err)
 			continue
 		}
 		go func(c net.Conn) {
 			s, err := h.NewStream(ctx, serverPeer.ID, TunnelProtocol)
 			if err != nil {
-				log.Printf("Failed to open stream to peer: %v", err)
 				c.Close()
 				return
 			}
@@ -398,31 +405,22 @@ func runClient(ctx context.Context, h host.Host, discovery *routing.RoutingDisco
 }
 
 // --- AES-GCM Proxy Logic ---
-
 func proxy(stream network.Stream, tcpConn net.Conn, key []byte) {
 	var wg sync.WaitGroup
 	wg.Add(2)
-
-	// 1. Local TCP -> Remote Libp2p (Encrypt)
 	go func() {
 		defer wg.Done()
 		if len(key) > 0 {
-			if err := gcmEncryptLoop(tcpConn, stream, key); err != nil {
-				// Silent fail on close is expected
-			}
+			gcmEncryptLoop(tcpConn, stream, key)
 		} else {
 			io.Copy(stream, tcpConn)
 		}
 		stream.CloseWrite()
 	}()
-
-	// 2. Remote Libp2p -> Local TCP (Decrypt)
 	go func() {
 		defer wg.Done()
 		if len(key) > 0 {
-			if err := gcmDecryptLoop(stream, tcpConn, key); err != nil {
-				// Silent fail on close is expected
-			}
+			gcmDecryptLoop(stream, tcpConn, key)
 		} else {
 			io.Copy(tcpConn, stream)
 		}
@@ -432,13 +430,11 @@ func proxy(stream network.Stream, tcpConn net.Conn, key []byte) {
 			tcpConn.Close()
 		}
 	}()
-
 	wg.Wait()
 	stream.Close()
 	tcpConn.Close()
 }
 
-// AES-GCM Encryption Loop (Chunked)
 func gcmEncryptLoop(src io.Reader, dst io.Writer, key []byte) error {
 	block, err := aes.NewCipher(key)
 	if err != nil {
@@ -448,10 +444,8 @@ func gcmEncryptLoop(src io.Reader, dst io.Writer, key []byte) error {
 	if err != nil {
 		return err
 	}
-
 	buf := make([]byte, ReadBufferSize)
 	header := make([]byte, 4+gcm.NonceSize())
-
 	for {
 		n, err := src.Read(buf)
 		if n > 0 {
@@ -459,11 +453,8 @@ func gcmEncryptLoop(src io.Reader, dst io.Writer, key []byte) error {
 			if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
 				return err
 			}
-
 			ciphertext := gcm.Seal(nil, nonce, buf[:n], nil)
-			totalLen := uint32(len(nonce) + len(ciphertext))
-			binary.BigEndian.PutUint32(header[:4], totalLen)
-
+			binary.BigEndian.PutUint32(header[:4], uint32(len(nonce)+len(ciphertext)))
 			if _, err := dst.Write(header[:4]); err != nil {
 				return err
 			}
@@ -483,7 +474,6 @@ func gcmEncryptLoop(src io.Reader, dst io.Writer, key []byte) error {
 	}
 }
 
-// AES-GCM Decryption Loop (Chunked)
 func gcmDecryptLoop(src io.Reader, dst io.Writer, key []byte) error {
 	block, err := aes.NewCipher(key)
 	if err != nil {
@@ -493,10 +483,8 @@ func gcmDecryptLoop(src io.Reader, dst io.Writer, key []byte) error {
 	if err != nil {
 		return err
 	}
-
 	lenBuf := make([]byte, 4)
 	nonce := make([]byte, gcm.NonceSize())
-
 	for {
 		if _, err := io.ReadFull(src, lenBuf); err != nil {
 			if err == io.EOF {
@@ -505,26 +493,21 @@ func gcmDecryptLoop(src io.Reader, dst io.Writer, key []byte) error {
 			return err
 		}
 		totalLen := binary.BigEndian.Uint32(lenBuf)
-
 		if totalLen > ReadBufferSize+uint32(gcm.Overhead())+uint32(gcm.NonceSize()) {
-			return fmt.Errorf("oversized chunk")
+			return fmt.Errorf("oversized")
 		}
-
 		if _, err := io.ReadFull(src, nonce); err != nil {
 			return err
 		}
-
 		cipherLen := totalLen - uint32(len(nonce))
 		cipherBuf := make([]byte, cipherLen)
 		if _, err := io.ReadFull(src, cipherBuf); err != nil {
 			return err
 		}
-
 		plaintext, err := gcm.Open(nil, nonce, cipherBuf, nil)
 		if err != nil {
 			return err
 		}
-
 		if _, err := dst.Write(plaintext); err != nil {
 			return err
 		}
