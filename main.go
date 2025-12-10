@@ -26,9 +26,9 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/pnet"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
-
 	dutil "github.com/libp2p/go-libp2p/p2p/discovery/util"
 	"github.com/multiformats/go-multiaddr"
+	manet "github.com/multiformats/go-multiaddr/net"
 )
 
 // Configuration Constants
@@ -149,6 +149,9 @@ func makeHost(ctx context.Context, pskPath, mode string, privKey crypto.PrivKey,
 	opts := []libp2p.Option{
 		libp2p.Identity(privKey),
 		libp2p.ListenAddrStrings(quicListen, tcpListen),
+		libp2p.AddrsFactory(func(m []multiaddr.Multiaddr) []multiaddr.Multiaddr {
+			return multiaddr.FilterAddrs(m, manet.IsPublicAddr)
+		}),
 	}
 
 	if mode == "relay" {
