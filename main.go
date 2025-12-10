@@ -269,43 +269,43 @@ func runServer(ctx context.Context, h host.Host, discovery *routing.RoutingDisco
 func runClient(ctx context.Context, h host.Host, discovery *routing.RoutingDiscovery, localPort string, dataKey []byte) {
 	var serverPeer peer.AddrInfo
 
-	log.Println("🔍 Starting discovery loop...")
+	// log.Println("🔍 Starting discovery loop...")
 
-	for {
-		log.Println("🔎 Searching DHT for server peer...")
-		peerChan, err := discovery.FindPeers(ctx, RendezvousStr)
-		if err != nil {
-			log.Printf("⚠️ Discovery error: %v", err)
-			time.Sleep(3 * time.Second)
-			continue
-		}
+	// for {
+	// 	log.Println("🔎 Searching DHT for server peer...")
+	// 	peerChan, err := discovery.FindPeers(ctx, RendezvousStr)
+	// 	if err != nil {
+	// 		log.Printf("⚠️ Discovery error: %v", err)
+	// 		time.Sleep(3 * time.Second)
+	// 		continue
+	// 	}
 
-		found := false
-		for p := range peerChan {
-			if p.ID == h.ID() {
-				continue
-			}
-			// We found someone!
-			log.Printf("✨ Discovered Peer: %s. Connecting...", p.ID)
+	// 	found := false
+	// 	for p := range peerChan {
+	// 		if p.ID == h.ID() {
+	// 			continue
+	// 		}
+	// 		// We found someone!
+	// 		log.Printf("✨ Discovered Peer: %s. Connecting...", p.ID)
 
-			if err := h.Connect(ctx, p); err != nil {
-				log.Printf("⚠️ Connection failed to %s: %v", p.ID, err)
-				continue
-			}
+	// 		if err := h.Connect(ctx, p); err != nil {
+	// 			log.Printf("⚠️ Connection failed to %s: %v", p.ID, err)
+	// 			continue
+	// 		}
 
-			serverPeer = p
-			found = true
-			log.Printf("✅ Connection Established to Server: %s", p.ID)
-			break
-		}
+	// 		serverPeer = p
+	// 		found = true
+	// 		log.Printf("✅ Connection Established to Server: %s", p.ID)
+	// 		break
+	// 	}
 
-		if found {
-			break
-		}
+	// 	if found {
+	// 		break
+	// 	}
 
-		log.Println("... No peers found yet. Retrying in 3s...")
-		time.Sleep(3 * time.Second)
-	}
+	// 	log.Println("... No peers found yet. Retrying in 3s...")
+	// 	time.Sleep(3 * time.Second)
+	// }
 
 	// Start Local Listener
 	listener, err := net.Listen("tcp", localPort)
