@@ -40,7 +40,7 @@ const (
 )
 
 // Global variable to hold the detected WAN IP (if any)
-var globalWanIP string
+// var globalWanIP string
 
 func main() {
 	// --- CLI Flags ---
@@ -79,19 +79,19 @@ func main() {
 		log.Println("🔒 AES-GCM Authenticated Encryption ENABLED")
 	}
 
-	// 1. IP Detection (Fallback Strategy)
-	// If we are a Server on WAN, we try to fetch our Public IP to ensure we advertise it
-	// even if AutoNAT fails due to firewall issues.
-	if *mode != "relay" {
-		go func() {
-			log.Println("🌍 Attempting to detect WAN IP via Web (Fallback)...")
-			ip := getWANIP()
-			if ip != "" {
-				log.Printf("✅ Detected WAN IP: %s", ip)
-				globalWanIP = ip
-			}
-		}()
-	}
+	// // 1. IP Detection (Fallback Strategy)
+	// // If we are a Server on WAN, we try to fetch our Public IP to ensure we advertise it
+	// // even if AutoNAT fails due to firewall issues.
+	// if *mode != "relay" {
+	// 	go func() {
+	// 		log.Println("🌍 Attempting to detect WAN IP via Web (Fallback)...")
+	// 		ip := getWANIP()
+	// 		if ip != "" {
+	// 			log.Printf("✅ Detected WAN IP: %s", ip)
+	// 			globalWanIP = ip
+	// 		}
+	// 	}()
+	// }
 
 	// 2. Load Identity
 	privKey, err := getIdentity(*identityPath)
@@ -169,14 +169,14 @@ func makeHost(ctx context.Context, pskPath, mode string, privKey crypto.PrivKey,
 		libp2p.AddrsFactory(func(addrs []multiaddr.Multiaddr) []multiaddr.Multiaddr {
 			var valid []multiaddr.Multiaddr
 
-			// 1. If we detected a WAN IP via Web, force inject it
-			if globalWanIP != "" {
-				// Try to construct a multiaddr for the detected IP using the bound port
-				extAddrStr := fmt.Sprintf("/ip4/%s/udp/%d/quic-v1", globalWanIP, port)
-				if ma, err := multiaddr.NewMultiaddr(extAddrStr); err == nil {
-					valid = append(valid, ma)
-				}
-			}
+			// // 1. If we detected a WAN IP via Web, force inject it
+			// if globalWanIP != "" {
+			// 	// Try to construct a multiaddr for the detected IP using the bound port
+			// 	extAddrStr := fmt.Sprintf("/ip4/%s/udp/%d/quic-v1", globalWanIP, port)
+			// 	if ma, err := multiaddr.NewMultiaddr(extAddrStr); err == nil {
+			// 		valid = append(valid, ma)
+			// 	}
+			// }
 
 			// 2. Process existing addresses
 			for _, addr := range addrs {
@@ -192,12 +192,6 @@ func makeHost(ctx context.Context, pskPath, mode string, privKey crypto.PrivKey,
 				}
 			}
 
-			// 3. Fallback: If we have NO Public/Relay addresses, return Private IPs
-			// This ensures we advertise *something* instead of nothing.
-			if len(valid) == 0 {
-				return addrs
-			}
-
 			return valid
 		}),
 	}
@@ -207,11 +201,13 @@ func makeHost(ctx context.Context, pskPath, mode string, privKey crypto.PrivKey,
 			libp2p.EnableRelayService(),
 			libp2p.ForceReachabilityPublic(),
 			libp2p.EnableNATService(),
+			libp2p.EnableAutoNATv2(),
 		)
 	} else {
 		opts = append(opts,
 			libp2p.EnableAutoRelayWithStaticRelays(bootstrapPeers),
 			libp2p.EnableHolePunching(),
+			libp2p.EnableAutoNATv2(),
 		)
 	}
 
