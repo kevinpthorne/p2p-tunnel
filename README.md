@@ -1,6 +1,6 @@
 # **WAN TCP Tunneler via Libp2p**
 
-A robust, private peer-to-peer TCP tunneler designed to connect distinct sites across a WAN without requiring port forwarding on the client or server sides. It utilizes a public Relay node to hole-punch through NATs and establish direct, encrypted QUIC connections.
+A robust, private peer-to-peer TCP tunneler designed to connect distinct sites across a WAN without requiring port forwarding on the client or server sides. It utilizes a public Relay node to hole-punch through NATs and establish direct, encrypted TCP or QUIC connections.
 
 ## **Features**
 
@@ -55,7 +55,7 @@ go run main.go \\
 | \-secret | swarm.key | Path to the Private Network Key (PSK) file. Must match on all nodes. |
 | \-port | 0 / 4001 | The specific UDP/TCP port to listen on. Defaults to 4001 for Relays and 0 (random ephemeral) for Clients/Servers. |
 | \-identity | identity-\<mode\>.key | Path to the node's private identity key. If missing, a new one is generated and saved. |
-| \-datakey | "" | Hex-encoded 32-byte key for additional AES-GCM data encryption. |
+| \-datakey | "" | Path to Hex-encoded 32-byte key for additional AES-GCM data encryption. |
 
 ## **Security: Generating the Data Key**
 
