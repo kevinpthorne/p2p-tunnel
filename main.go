@@ -13,7 +13,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -31,6 +30,8 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	dutil "github.com/libp2p/go-libp2p/p2p/discovery/util"
 	basichost "github.com/libp2p/go-libp2p/p2p/host/basic"
+
+	// quic "github.com/libp2p/go-libp2p/p2p/transport/quic"
 	"github.com/multiformats/go-multiaddr"
 	manet "github.com/multiformats/go-multiaddr/net"
 )
@@ -41,9 +42,6 @@ const (
 	RendezvousStr  = "my-unique-cluster-service-id" // CHANGE THIS for different clusters
 	ReadBufferSize = 32 * 1024                      // 32KB chunks for GCM
 )
-
-// Global variable to hold the detected WAN IP (if any)
-var globalWanIP string
 
 func main() {
 	// --- CLI Flags ---
@@ -82,20 +80,6 @@ func main() {
 		log.Println("🔒 AES-GCM Authenticated Encryption ENABLED")
 	}
 
-	// 1. IP Detection (Fallback Strategy)
-	// If we are a Server on WAN, we try to fetch our Public IP to ensure we advertise it
-	// even if AutoNAT fails due to firewall issues.
-	if *mode != "relay" {
-		go func() {
-			log.Println("🌍 Attempting to detect WAN IP via Web (Fallback)...")
-			ip := getWANIP()
-			if ip != "" {
-				log.Printf("✅ Detected WAN IP: %s", ip)
-				globalWanIP = ip
-			}
-		}()
-	}
-
 	// 2. Load Identity
 	privKey, err := getIdentity(*identityPath)
 	if err != nil {
@@ -127,6 +111,23 @@ func main() {
 		time.Sleep(2 * time.Second)
 	}
 
+	// // Wait until external addresses is observed with server's NAT service.
+	// idService := h.(*autorelay.AutoRelayHost).Host.(*basichost.BasicHost).IDService()
+	// for {
+	// 	hasPublicAddr := false
+	// 	for _, addr := range idService.OwnObservedAddrs() {
+	// 		if manet.IsPublicAddr(addr) {
+	// 			hasPublicAddr = true
+	// 			break
+	// 		}
+	// 	}
+	// 	if hasPublicAddr {
+	// 		log.Printf("Observed self Addrs: %v\n", idService.OwnObservedAddrs())
+	// 		break
+	// 	}
+	// 	time.Sleep(1 * time.Second)
+	// }
+
 	// 5. Start DHT
 	log.Println("🔄 Bootstrapping DHT...")
 	if err := dhtObj.Bootstrap(ctx); err != nil {
@@ -139,6 +140,15 @@ func main() {
 	switch *mode {
 	case "relay":
 		log.Println("🟢 Relay Active. Waiting for peers...")
+		go func() {
+			for {
+				log.Println("--- Relay Addresses (Copy one of these to clients) ---")
+				for _, a := range h.Addrs() {
+					log.Printf("%s/p2p/%s", a, h.ID())
+				}
+				time.Sleep(5 * time.Minute)
+			}
+		}()
 		select {}
 	case "server":
 		runServer(h, routingDiscovery, *target, dataKey, finalPort)
@@ -150,7 +160,7 @@ func main() {
 // --- Host Factory & Identity ---
 
 func makeHost(ctx context.Context, pskPath, mode string, privKey crypto.PrivKey, relayAddrStr string, port int) (host.Host, *dht.IpfsDHT, error) {
-	quicListen := fmt.Sprintf("/ip4/0.0.0.0/udp/%d/quic", port)
+	// quicListen := fmt.Sprintf("/ip4/0.0.0.0/udp/%d/quic-v1", port)
 	tcpListen := fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", port)
 
 	var bootstrapPeers []peer.AddrInfo
@@ -166,55 +176,24 @@ func makeHost(ctx context.Context, pskPath, mode string, privKey crypto.PrivKey,
 
 	opts := []libp2p.Option{
 		libp2p.Identity(privKey),
-		libp2p.ListenAddrStrings(quicListen, tcpListen),
-
-		// ADDRS FACTORY (The Logic Core)
-		libp2p.AddrsFactory(func(addrs []multiaddr.Multiaddr) []multiaddr.Multiaddr {
-			var valid []multiaddr.Multiaddr
-
-			// 1. If we detected a WAN IP via Web, force inject it
-			if globalWanIP != "" {
-				// Try to construct a multiaddr for the detected IP using the bound port
-				extAddrStr := fmt.Sprintf("/ip4/%s/udp/%d/quic", globalWanIP, port)
-				extAddrStr2 := fmt.Sprintf("/ip4/%s/tcp/%d", globalWanIP, port)
-				if ma, err := multiaddr.NewMultiaddr(extAddrStr); err == nil {
-					valid = append(valid, ma)
-				}
-				if ma, err := multiaddr.NewMultiaddr(extAddrStr2); err == nil {
-					valid = append(valid, ma)
-				}
-			}
-
-			// 2. Process existing addresses
-			for _, addr := range addrs {
-				// Always allow Relay Addresses
-				if strings.Contains(addr.String(), "p2p-circuit") {
-					valid = append(valid, addr)
-					continue
-				}
-				// Allow Public IPs (IPv4/IPv6) from AutoNAT
-				if manet.IsPublicAddr(addr) {
-					valid = append(valid, addr)
-					continue
-				}
-			}
-
-			return valid
+		// libp2p.Transport(quic.NewTransport),
+		libp2p.ListenAddrStrings(/*quicListen, */tcpListen),
+		libp2p.AddrsFactory(func(m []multiaddr.Multiaddr) []multiaddr.Multiaddr {
+			return multiaddr.FilterAddrs(m, manet.IsPublicAddr)
 		}),
 	}
 
 	if mode == "relay" {
 		opts = append(opts,
-			libp2p.EnableRelayService(),
-			libp2p.EnableAutoNATv2(),
 			libp2p.ForceReachabilityPublic(),
-			// libp2p.EnableNATService(),
+			libp2p.EnableRelayService(),
+			libp2p.EnableNATService(),
 		)
 	} else {
 		opts = append(opts,
+			libp2p.ForceReachabilityPrivate(),
 			libp2p.EnableAutoRelayWithStaticRelays(bootstrapPeers),
 			libp2p.EnableHolePunching(),
-			libp2p.EnableAutoNATv2(),
 		)
 	}
 
@@ -266,32 +245,6 @@ func getIdentity(path string) (crypto.PrivKey, error) {
 	data, _ := crypto.MarshalPrivateKey(priv)
 	os.WriteFile(path, data, 0600)
 	return priv, nil
-}
-
-// Helper to get WAN IP from external services
-func getWANIP() string {
-	services := []string{
-		"https://api.ipify.org?format=text",
-		"https://ifconfig.me/ip",
-		"https://icanhazip.com",
-	}
-	client := &http.Client{Timeout: 5 * time.Second}
-	for _, service := range services {
-		resp, err := client.Get(service)
-		if err != nil {
-			continue
-		}
-		defer resp.Body.Close()
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			continue
-		}
-		ipStr := strings.TrimSpace(string(body))
-		if net.ParseIP(ipStr) != nil {
-			return ipStr
-		}
-	}
-	return ""
 }
 
 func connectToPeer(ctx context.Context, h host.Host, target string) {
