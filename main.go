@@ -22,12 +22,15 @@ import (
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	"github.com/libp2p/go-libp2p/core/crypto"
+
+	// "github.com/libp2p/go-libp2p/core/event"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/pnet"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	dutil "github.com/libp2p/go-libp2p/p2p/discovery/util"
+	basichost "github.com/libp2p/go-libp2p/p2p/host/basic"
 	"github.com/multiformats/go-multiaddr"
 	manet "github.com/multiformats/go-multiaddr/net"
 )
@@ -40,7 +43,7 @@ const (
 )
 
 // Global variable to hold the detected WAN IP (if any)
-// var globalWanIP string
+var globalWanIP string
 
 func main() {
 	// --- CLI Flags ---
@@ -79,19 +82,19 @@ func main() {
 		log.Println("🔒 AES-GCM Authenticated Encryption ENABLED")
 	}
 
-	// // 1. IP Detection (Fallback Strategy)
-	// // If we are a Server on WAN, we try to fetch our Public IP to ensure we advertise it
-	// // even if AutoNAT fails due to firewall issues.
-	// if *mode != "relay" {
-	// 	go func() {
-	// 		log.Println("🌍 Attempting to detect WAN IP via Web (Fallback)...")
-	// 		ip := getWANIP()
-	// 		if ip != "" {
-	// 			log.Printf("✅ Detected WAN IP: %s", ip)
-	// 			globalWanIP = ip
-	// 		}
-	// 	}()
-	// }
+	// 1. IP Detection (Fallback Strategy)
+	// If we are a Server on WAN, we try to fetch our Public IP to ensure we advertise it
+	// even if AutoNAT fails due to firewall issues.
+	if *mode != "relay" {
+		go func() {
+			log.Println("🌍 Attempting to detect WAN IP via Web (Fallback)...")
+			ip := getWANIP()
+			if ip != "" {
+				log.Printf("✅ Detected WAN IP: %s", ip)
+				globalWanIP = ip
+			}
+		}()
+	}
 
 	// 2. Load Identity
 	privKey, err := getIdentity(*identityPath)
@@ -147,7 +150,7 @@ func main() {
 // --- Host Factory & Identity ---
 
 func makeHost(ctx context.Context, pskPath, mode string, privKey crypto.PrivKey, relayAddrStr string, port int) (host.Host, *dht.IpfsDHT, error) {
-	quicListen := fmt.Sprintf("/ip4/0.0.0.0/udp/%d/quic-v1", port)
+	quicListen := fmt.Sprintf("/ip4/0.0.0.0/udp/%d/quic", port)
 	tcpListen := fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", port)
 
 	var bootstrapPeers []peer.AddrInfo
@@ -169,14 +172,18 @@ func makeHost(ctx context.Context, pskPath, mode string, privKey crypto.PrivKey,
 		libp2p.AddrsFactory(func(addrs []multiaddr.Multiaddr) []multiaddr.Multiaddr {
 			var valid []multiaddr.Multiaddr
 
-			// // 1. If we detected a WAN IP via Web, force inject it
-			// if globalWanIP != "" {
-			// 	// Try to construct a multiaddr for the detected IP using the bound port
-			// 	extAddrStr := fmt.Sprintf("/ip4/%s/udp/%d/quic-v1", globalWanIP, port)
-			// 	if ma, err := multiaddr.NewMultiaddr(extAddrStr); err == nil {
-			// 		valid = append(valid, ma)
-			// 	}
-			// }
+			// 1. If we detected a WAN IP via Web, force inject it
+			if globalWanIP != "" {
+				// Try to construct a multiaddr for the detected IP using the bound port
+				extAddrStr := fmt.Sprintf("/ip4/%s/udp/%d/quic", globalWanIP, port)
+				extAddrStr2 := fmt.Sprintf("/ip4/%s/tcp/%d", globalWanIP, port)
+				if ma, err := multiaddr.NewMultiaddr(extAddrStr); err == nil {
+					valid = append(valid, ma)
+				}
+				if ma, err := multiaddr.NewMultiaddr(extAddrStr2); err == nil {
+					valid = append(valid, ma)
+				}
+			}
 
 			// 2. Process existing addresses
 			for _, addr := range addrs {
@@ -199,9 +206,9 @@ func makeHost(ctx context.Context, pskPath, mode string, privKey crypto.PrivKey,
 	if mode == "relay" {
 		opts = append(opts,
 			libp2p.EnableRelayService(),
-			libp2p.ForceReachabilityPublic(),
-			libp2p.EnableNATService(),
 			libp2p.EnableAutoNATv2(),
+			libp2p.ForceReachabilityPublic(),
+			// libp2p.EnableNATService(),
 		)
 	} else {
 		opts = append(opts,
@@ -316,6 +323,15 @@ func runServer(h host.Host, discovery *routing.RoutingDiscovery, targetPort stri
 			log.Println("--- Current Advertised Addresses ---")
 			for _, a := range addrs {
 				log.Printf("   %s/p2p/%s", a, h.ID())
+			}
+
+			if basicHost, ok := h.(*basichost.BasicHost); ok {
+				// Returns reachable, unreachable, and unknown addresses
+				reachable, unreachable, unknown := basicHost.ConfirmedAddrs()
+
+				log.Println("Verified Public Addresses:", reachable)
+				log.Println("Blocked/Private Addresses:", unreachable)
+				log.Println("Pending Verification:", unknown)
 			}
 			time.Sleep(30 * time.Second)
 		}
