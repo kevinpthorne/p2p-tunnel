@@ -29,7 +29,8 @@ import (
 	"github.com/libp2p/go-libp2p/core/pnet"
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	dutil "github.com/libp2p/go-libp2p/p2p/discovery/util"
-	basichost "github.com/libp2p/go-libp2p/p2p/host/basic"
+
+	// basichost "github.com/libp2p/go-libp2p/p2p/host/basic"
 
 	// quic "github.com/libp2p/go-libp2p/p2p/transport/quic"
 	"github.com/multiformats/go-multiaddr"
@@ -50,7 +51,7 @@ func main() {
 	secretKeyPath := flag.String("secret", "swarm.key", "Path to the Private Network Key (PSK)")
 	identityPath := flag.String("identity", "", "Path to Identity Key (Default: identity-<mode>.key)")
 	relayAddr := flag.String("relay", "", "Multiaddr of the Relay/Bootstrap node (Required for WAN)")
-	dataKeyHex := flag.String("datakey", "", "Hex-encoded 32-byte key for AES-GCM data encryption")
+	dataKeyPath := flag.String("datakey", "", "Hex-encoded 32-byte key for AES-GCM data encryption")
 	listenPort := flag.Int("port", 0, "Port to listen on (Default: 4001 for relay, random/0 for client/server)")
 	flag.Parse()
 
@@ -68,9 +69,15 @@ func main() {
 
 	// 0. Parse Data Encryption Key
 	var dataKey []byte
-	if *dataKeyHex != "" {
+	if *dataKeyPath != "" {
 		var err error
-		dataKey, err = hex.DecodeString(*dataKeyHex)
+		dataKeyHex, err := os.ReadFile(*dataKeyPath)
+		if err != nil {
+			log.Fatalf("Invalid data key hex: %v", err)
+		}
+		stringDataKeyHex := string(dataKeyHex)
+		trimmedDataKeyHex := strings.TrimSpace(stringDataKeyHex)
+		dataKey, err = hex.DecodeString(trimmedDataKeyHex)
 		if err != nil {
 			log.Fatalf("Invalid data key hex: %v", err)
 		}
@@ -110,23 +117,6 @@ func main() {
 		// Give AutoRelay a moment to reserve a slot, but don't block forever
 		time.Sleep(2 * time.Second)
 	}
-
-	// // Wait until external addresses is observed with server's NAT service.
-	// idService := h.(*autorelay.AutoRelayHost).Host.(*basichost.BasicHost).IDService()
-	// for {
-	// 	hasPublicAddr := false
-	// 	for _, addr := range idService.OwnObservedAddrs() {
-	// 		if manet.IsPublicAddr(addr) {
-	// 			hasPublicAddr = true
-	// 			break
-	// 		}
-	// 	}
-	// 	if hasPublicAddr {
-	// 		log.Printf("Observed self Addrs: %v\n", idService.OwnObservedAddrs())
-	// 		break
-	// 	}
-	// 	time.Sleep(1 * time.Second)
-	// }
 
 	// 5. Start DHT
 	log.Println("🔄 Bootstrapping DHT...")
@@ -177,7 +167,7 @@ func makeHost(ctx context.Context, pskPath, mode string, privKey crypto.PrivKey,
 	opts := []libp2p.Option{
 		libp2p.Identity(privKey),
 		// libp2p.Transport(quic.NewTransport),
-		libp2p.ListenAddrStrings(/*quicListen, */tcpListen),
+		libp2p.ListenAddrStrings( /*quicListen, */ tcpListen),
 		libp2p.AddrsFactory(func(m []multiaddr.Multiaddr) []multiaddr.Multiaddr {
 			return multiaddr.FilterAddrs(m, manet.IsPublicAddr)
 		}),
@@ -276,15 +266,6 @@ func runServer(h host.Host, discovery *routing.RoutingDiscovery, targetPort stri
 			log.Println("--- Current Advertised Addresses ---")
 			for _, a := range addrs {
 				log.Printf("   %s/p2p/%s", a, h.ID())
-			}
-
-			if basicHost, ok := h.(*basichost.BasicHost); ok {
-				// Returns reachable, unreachable, and unknown addresses
-				reachable, unreachable, unknown := basicHost.ConfirmedAddrs()
-
-				log.Println("Verified Public Addresses:", reachable)
-				log.Println("Blocked/Private Addresses:", unreachable)
-				log.Println("Pending Verification:", unknown)
 			}
 			time.Sleep(30 * time.Second)
 		}
