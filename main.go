@@ -53,6 +53,7 @@ func main() {
 	relayAddr := flag.String("relay", "", "Multiaddr of the Relay/Bootstrap node (Required for WAN)")
 	dataKeyPath := flag.String("datakey", "", "Hex-encoded 32-byte key for AES-GCM data encryption")
 	listenPort := flag.Int("port", 0, "Port to listen on (Default: 4001 for relay, random/0 for client/server)")
+	serverId := flag.String("server", "", "ID of server to connect to. Connects to first if left blank")
 	flag.Parse()
 
 	if *identityPath == "" {
@@ -143,7 +144,7 @@ func main() {
 	case "server":
 		runServer(h, routingDiscovery, *target, dataKey, finalPort)
 	case "client":
-		runClient(ctx, h, routingDiscovery, *target, dataKey)
+		runClient(ctx, h, routingDiscovery, *target, *serverId, dataKey)
 	}
 }
 
@@ -287,7 +288,7 @@ func runServer(h host.Host, discovery *routing.RoutingDiscovery, targetPort stri
 	select {}
 }
 
-func runClient(ctx context.Context, h host.Host, discovery *routing.RoutingDiscovery, localPort string, dataKey []byte) {
+func runClient(ctx context.Context, h host.Host, discovery *routing.RoutingDiscovery, localPort string, serverId string, dataKey []byte) {
 	var serverPeer peer.AddrInfo
 	log.Println("🔍 Starting discovery loop...")
 
@@ -303,6 +304,9 @@ func runClient(ctx context.Context, h host.Host, discovery *routing.RoutingDisco
 		found := false
 		for p := range peerChan {
 			if p.ID == h.ID() {
+				continue
+			}
+			if serverId != "" && p.ID.String() != serverId {
 				continue
 			}
 
